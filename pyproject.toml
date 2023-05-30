@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "codeslim"
+version = "0.0.1"
+description = "CodeSlim is a library that automatically extracts and refactors code based on required dependencies. It's based on AST to optimize your codebase by extracting relevant functions and classes into more modular components, making it easier to manage and maintain."
+authors = ["Asthestarsfalll <1186454801@qq.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+astpretty = "^3.0.0"
+astor = "^0.8.1"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
