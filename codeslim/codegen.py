@@ -1,13 +1,14 @@
 import os
 import os.path as osp
 import shutil
-from ast import AST, Import, ImportFrom, NodeTransformer
+from ast import AST, ClassDef, FunctionDef, Import, ImportFrom, NodeTransformer
+from collections import defaultdict
 from typing import Callable, Dict, List, Optional, Union
 
 import astor
-from astpretty import pprint
+from astpretty import pprint  # for pdb debug
 
-from .parse import DefaultASTParser, Parser
+from .parse import Parser
 from .utils import cd
 
 __all__ = ["FileLevelCodeGenerator", "SegmentCodeGenerator"]
@@ -76,24 +77,46 @@ class Rewriter(NodeTransformer):
 
 class FileLevelCodeGenerator(CodeGenerator):
     def __init__(
-        self, target_dir, parser: Parser, module_mapper: Optional[Dict[str, str]] = None
+            self, target_dir, parser: Parser, module_mapper: Optional[Dict[str, str]] = None, custom_rewriter: Optional[Dict[str, Callable]] = None
     ):
         self.target_dir = target_dir
         self.parsers = parser.get_parsers()
         self.module_mapper = module_mapper or {}
-        self.rewriter = Rewriter(
-            {"Import": self.rewrite_imports, "ImportFrom": self.rewrite_imports}
-        )
+        self.custom_rewriter = custom_rewriter
+        self.rewriter = Rewriter(self._get_rewriter())
+        self.imports_info = self._get_imports_info(parser.relations)
+        self.cur_info = None
+
+    def _get_imports_info(self, relation):
+        extra_info = defaultdict(list)
+        for file, target_file in relation.items():
+            for f in target_file:
+                extra_info[f].append(file)
+        return extra_info 
+
+    def _get_rewriter(self):
+        rewrite_funcs = {"Import": self.rewrite_imports, "ImportFrom": self.rewrite_imports}
+        if self.custom_rewriter is not None:
+            rewrite_funcs.update(self.custom_rewriter)
+        return rewrite_funcs
+
+    def _preprocess(self, file, parser):
+        pass
+
+    def _postprocess(self):
+        pass
 
     def generate(self):
         self.makedirs(self.target_dir)
         with cd(self.target_dir):
-            for parser in self.parsers:
+            for file, parser in self.parsers.items():
                 file_name = osp.basename(parser.file_name)
                 # TODO(Asthestarsfalll): need to process __init__ file
                 if file_name == "__init__.py":
                     continue
+                self._preprocess(file, parser)
                 self.rewriter.visit(parser.ast)
+                self._postprocess()
                 self._generate_from_ast(file_name, parser.ast)
 
     def rewrite_imports(self, node: Union[ImportFrom, Import]) -> AST:
@@ -102,6 +125,7 @@ class FileLevelCodeGenerator(CodeGenerator):
             if module_name in self.module_mapper:
                 module_name = self.module_mapper[module_name]
             else:
+                # need automatically get the file where the imported module belongs to
                 module_name = module_name.split(".")[-1]
             node.module = module_name
 
@@ -109,4 +133,39 @@ class FileLevelCodeGenerator(CodeGenerator):
 
 
 class SegmentCodeGenerator(FileLevelCodeGenerator):
-    pass
+
+    def _get_rewriter(self):
+        rewrite_funcs = {
+                "Import": self.rewrite_imports, 
+                "ImportFrom": self.rewrite_imports, 
+                'FunctionDef': self.rewrite_defs, 
+                'ClassDef': self.rewrite_defs
+        }
+        if self.custom_rewriter is not None:
+            rewrite_funcs.update(self.custom_rewriter)
+        return rewrite_funcs
+    
+    def _analyze_local_calls(self, parser):
+        calls = parser._calls
+        defs = parser._local_defs
+        local_used = []
+        # TODO(Asthestarsfalll): reduce the size of calls
+        if calls and defs:
+            # TODO(Asthestarsfalll): need more logic to tackle complex situation.
+            for name, call in calls.items():
+                if name in defs:
+                    local_used.append(name)
+        return local_used
+
+    def _preprocess(self, file, parser):
+        extern_uesd = []
+        for i in self.imports_info[file]:
+            p = self.parsers[i]
+            extern_uesd += p.get_target_import_names()
+        self.extern_used = extern_uesd
+        self.local_used = self._analyze_local_calls(parser)
+
+    def rewrite_defs(self, node: Union[FunctionDef, ClassDef]):
+        if node.name not in self.extern_used and node.name not in self.local_used:
+            return None
+        return node

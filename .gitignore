@@ -1,4 +1,6 @@
 workspace
 target
+file_level
+segment_level
 __pycache__
 *.lock

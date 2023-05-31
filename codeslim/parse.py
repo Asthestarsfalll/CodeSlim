@@ -2,7 +2,7 @@ import importlib
 import os
 from ast import (AST, Attribute, Call, ClassDef, Constant, FunctionDef, Import,
                  ImportFrom, Name, NodeVisitor, Subscript)
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
@@ -25,10 +25,11 @@ class _ImportNode:
     import_name: str
     module: str
     alias_name: Optional[str]
+    is_target: bool = False
 
     def _parse_module(self, endpoints):
         module_name = self.module
-        # need cache to prevent some heavy import?
+        # need cache to prevent some heavy imports?
         try:
             imported_module = importlib.import_module(module_name)
             assert imported_module is not None
@@ -37,17 +38,19 @@ class _ImportNode:
             file_path = imported_module.__file__
         except ModuleNotFoundError:
             # just a workaround for relative import
+            # should find some other methods.
             file_path = os.path.join(
                 os.getcwd(), module_name.replace(".", os.sep) + ".py"
             )
             if not os.path.exists(file_path):
                 raise RuntimeError(f"Cannot import module {module_name}")
         if not endpoints.check(locals()):
-            # if we do not attach file_path
-            # it will get wrong result...
-            file_path = file_path
+            # FIXME (Asthestarsfalll): may produce inconsistent results due to some unknown reasons.
+            # ugly patch
             self.node.is_target = True
+            self.is_target = True
             return file_path
+
 
 
 @dataclass
@@ -105,16 +108,16 @@ class _PassController:
 
 class DefaultASTParser(NodeVisitor):
     def __init__(
-        self, ast: AST, endpoints: EndPointManager, file_name: str, base_module=None
+            self, ast: AST, endpoints: EndPointManager, file_name: str, call_info=None
     ):
         self.ast = ast
         self.endpoints = endpoints
         self.file_name = file_name
         self.file_path = os.path.dirname(file_name)
-        self.base_module = base_module
+        self.call_info = call_info
         self._pass_controller = _PassController()
         # store imported modules, functions, classes and variables
-        # FIXME(Asthestarsfalll): handle alias of the imported, as well as functions.partial
+        # FIXME(Asthestarsfalll): handle alias of the imported, as well as functions.partial...
         self._imports: Dict[str, _ImportNode] = {}
         self._uncertain_imports: List[_ImportNode] = []
         self._local_defs: OrderedDict[str, _DefNode] = OrderedDict()
@@ -124,6 +127,10 @@ class DefaultASTParser(NodeVisitor):
     def get_import_path(self):
         import_path = [i._parse_module(self.endpoints) for i in self._imports.values()]
         return [i for i in import_path if i]
+
+    def get_target_import_names(self):
+        list(self._imports.keys())
+        return [i for i, v in self._imports.items() if v.is_target]
 
     def info(self):
         print("Imports:\n", self._imports)
@@ -154,6 +161,8 @@ class DefaultASTParser(NodeVisitor):
             import_node = _ImportNode(node, name, module_name, import_name.asname)
             if name != "*":
                 # FIXME(Asthestarsfalll): add some code to handle overridden imports.
+                # TODO(Asthestarsfalll): use endpoint to sign the target imports and the others,
+                #       so we can reduce the size of self._calls
                 self._imports[name] = import_node
             else:
                 self._uncertain_imports.append(import_node)
@@ -167,7 +176,7 @@ class DefaultASTParser(NodeVisitor):
     def visit_ClassDef(self, node: ClassDef):
         for func in node.body:
             if isinstance(func, FunctionDef):
-                self._local_defs[node.name] = _DefNode(node, _DefType.Method, node.name)
+                self._local_defs[func.name] = _DefNode(node, _DefType.Method, node.name)
                 self._pass_controller.attach(func)
         self._local_defs[node.name] = _DefNode(node, _DefType.Class)
 
@@ -221,10 +230,10 @@ class DefaultASTParser(NodeVisitor):
         if trace_info:
             trace_info.reverse()
             name = "".join(trace_info)
-        if name not in self._local_defs:
+        # if name not in self._local_defs:
             # just build them, and clean it after whole parse stage
             # prevent some issues caused by visit order (maybe)
-            self._calls[name] = _CallNode(name, trace_info)
+        self._calls[name] = _CallNode(name, trace_info)
 
     # for getattr, but it also will be caught by visit_Call
     # maybe not need
@@ -236,48 +245,52 @@ class DefaultASTParser(NodeVisitor):
 
 
 class Parser:
-    def __init__(self, entry: Entry, endpoints=None):
+    def __init__(self, entry: Entry, endpoints=None, parser_type=DefaultASTParser):
         self.cache = set(*entry.get_cache())
         if endpoints is None:
             endpoints = LocalEndPoint(os.path.commonprefix(list(self.cache)))
         self.entry = entry
+        self.parser_type = parser_type
         self.endpoints = EndPointManager(endpoints)
+        self.ast_parsers = self._build_parsers(self.entry)
+        self.relations = defaultdict(list)
         self.parse()
 
     def _build_parsers(self, entry):
-        return [DefaultASTParser(ast, self.endpoints, file) for file, ast in entry]
+        parsers = {}
+        for file, ast in entry:
+            parsers[file] = self.parser_type(ast, self.endpoints, file)
+        return parsers
 
     def parse(self):
-        ast_parsers = self._build_parsers(self.entry)
-        temp = [*ast_parsers]
+        temp = list(self.ast_parsers.values())
         module_path = []
 
         def _update_path():
+            module_path.clear()
             for i in temp:
                 # for some local imports
                 with cd(i.file_path):
-                    path = set(i.get_import_path())
-                for p in path:
+                    paths = set(i.get_import_path())
+                self.relations[os.path.join(i.file_path, i.file_name)].extend(paths)
+                for p in paths:
                     if p not in self.cache:
                         module_path.append(p)
-                    self.cache.add(p)
+                        self.cache.add(p)
 
         _update_path()
         while len(module_path) > 0:
-            new_entry = [self.entry.build(p) for p in module_path]
-            module_path.clear()
-            for e in new_entry:
-                parsers = self._build_parsers(e)
-                ast_parsers.extend(parsers)
-                temp.clear()
-                temp.extend(parsers)
-
+            # new_entry = [self.entry.build(p) for p in module_path]
+            entry = self.entry.build(module_path)
+            parsers = self._build_parsers(entry)
+            temp = list(parsers.values())
+            self.ast_parsers.update(parsers)
             _update_path()
-        self.ast_pasers = ast_parsers
 
     def info(self):
-        for p in self.ast_pasers:
-            p.info()
+        for file, parser in self.ast_parsers.items():
+            print(f"----------{file}----------")
+            parser.info()
 
     def get_parsers(self):
-        return self.ast_pasers
+        return self.ast_parsers

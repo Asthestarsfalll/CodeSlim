@@ -20,3 +20,10 @@ def get_dataloader(batch_size):
         dataset=train_dataset, batch_size=batch_size, shuffle=True
     )
     return train_loader
+
+def get_testdataloader(batch_size):
+    train_dataset = RandomDataset()
+    train_loader = DataLoader(
+        dataset=train_dataset, batch_size=batch_size, shuffle=True
+    )
+    return train_loader
