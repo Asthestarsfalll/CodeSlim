@@ -21,6 +21,7 @@ def get_dataloader(batch_size):
     )
     return train_loader
 
+
 def get_testdataloader(batch_size):
     train_dataset = RandomDataset()
     train_loader = DataLoader(

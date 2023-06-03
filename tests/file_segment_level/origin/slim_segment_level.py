@@ -1,3 +1,3 @@
 from codeslim import AutoSlim
 
-AutoSlim('./train.py', '../segment_level/').mode(AutoSlim.SegmentLevel).generate()
+AutoSlim("./train.py", "../segment_level/").mode(AutoSlim.SegmentLevel).generate()

@@ -1,6 +1,7 @@
 import ast
 import os
 from abc import ABCMeta, abstractmethod
+from ast import ClassDef
 from typing import Sequence, Union
 
 # Need to be refactored
@@ -35,8 +36,8 @@ class Entry(metaclass=ABCMeta):
 
 class FileEntry(Entry):
     def __init__(self, entry_files: Union[str, Sequence[str]]) -> None:
-        self.entries = [entry_files] if isinstance(entry_files, str) else entry_files
-        self.entries = [os.path.abspath(i) for i in self.entries]
+        entries = [entry_files] if isinstance(entry_files, str) else entry_files
+        self.entries = [os.path.abspath(i) for i in entries]
         self.asts = self.convert_to_ast(self.entries)
 
     def convert_to_ast(self, entries):
@@ -54,3 +55,12 @@ class StringEntry(Entry):
 # TODO(Asthestarsfall): support for Function/ClassEntry
 class SegmentEntry(Entry):
     pass
+
+
+class ClassEntry(SegmentEntry):
+    def __init__(self, class_nodes: ClassDef):
+        self.entries = class_nodes
+        self.ast = self.convert_to_ast(class_nodes)
+
+    def convert_to_ast(self, entries):
+        pass

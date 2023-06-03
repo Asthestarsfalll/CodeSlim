@@ -39,9 +39,10 @@ class _ImportNode:
         except ModuleNotFoundError:
             # just a workaround for relative import
             # should find some other methods.
-            file_path = os.path.join(
-                os.getcwd(), module_name.replace(".", os.sep) + ".py"
-            )
+            with cd("." * self.node.level):
+                file_path = os.path.join(
+                    os.getcwd(), module_name.replace(".", os.sep) + ".py"
+                )
             if not os.path.exists(file_path):
                 raise RuntimeError(f"Cannot import module {module_name}")
         if not endpoints.check(locals()):
@@ -50,7 +51,6 @@ class _ImportNode:
             self.node.is_target = True
             self.is_target = True
             return file_path
-
 
 
 @dataclass
@@ -71,21 +71,22 @@ class _DefNode:
         node: Union[FunctionDef, ClassDef],
         def_type: _DefType,
         parent: Optional[str] = None,
-        base: Optional[str] = None,
-        meta: Optional[str] = None,
+        bases: Optional[str] = None,
+        metas: Optional[str] = None,
     ) -> None:
         if not isinstance(node, (FunctionDef, ClassDef)):
             raise TypeError()
         self.name = node.name
         self.def_type = def_type
         self.parent = parent
-        self.lineno = node.lineno
-        self.end_lineno = node.end_lineno
-        self.base = base
-        self.meta = meta
+        self.node = node
+        self.bases = bases
+        self.metas = metas
 
     def __repr__(self) -> str:
-        return f"_DefNode(name={self.name})"
+        return (
+            f"_DefNode(name={self.name}, bases={self.bases}, self.metas={self.metas})"
+        )
 
 
 class _PassController:
@@ -107,14 +108,11 @@ class _PassController:
 
 
 class DefaultASTParser(NodeVisitor):
-    def __init__(
-            self, ast: AST, endpoints: EndPointManager, file_name: str, call_info=None
-    ):
+    def __init__(self, ast: AST, endpoints: EndPointManager, file_name: str):
         self.ast = ast
         self.endpoints = endpoints
         self.file_name = file_name
         self.file_path = os.path.dirname(file_name)
-        self.call_info = call_info
         self._pass_controller = _PassController()
         # store imported modules, functions, classes and variables
         # FIXME(Asthestarsfalll): handle alias of the imported, as well as functions.partial...
@@ -122,6 +120,7 @@ class DefaultASTParser(NodeVisitor):
         self._uncertain_imports: List[_ImportNode] = []
         self._local_defs: OrderedDict[str, _DefNode] = OrderedDict()
         self._calls: Dict[str, _CallNode] = {}
+        self._to_merge_classes: Optional[Dict] = {}
         self.visit(self.ast)
 
     def get_import_path(self):
@@ -131,6 +130,17 @@ class DefaultASTParser(NodeVisitor):
     def get_target_import_names(self):
         list(self._imports.keys())
         return [i for i, v in self._imports.items() if v.is_target]
+
+    def get_target_merge_class(self):
+        cls_names = {}
+        for name, node in self._local_defs.items():
+            if node.def_type == _DefType.Class and node.bases:
+                # FIXME
+                new_bases = [i for i in node.bases if i in self._imports]
+                node.bases = new_bases or None
+                if new_bases:
+                    cls_names[name] = new_bases
+        self._to_merge_classes = cls_names
 
     def info(self):
         print("Imports:\n", self._imports)
@@ -171,26 +181,37 @@ class DefaultASTParser(NodeVisitor):
     visit_ImportFrom = _visit_import
 
     def visit_FunctionDef(self, node: FunctionDef):
+        # Maybe we don't need to store inner function
         self._local_defs[node.name] = _DefNode(node, _DefType.Function)
 
     def visit_ClassDef(self, node: ClassDef):
         for func in node.body:
             if isinstance(func, FunctionDef):
-                self._local_defs[func.name] = _DefNode(node, _DefType.Method, node.name)
+                def_node = _DefNode(node, _DefType.Method, node.name)
+                self._local_defs[func.name] = def_node
                 self._pass_controller.attach(func)
-        self._local_defs[node.name] = _DefNode(node, _DefType.Class)
 
-    def _get_call_name(self, node, trace_info):
+        # FIXME(Asthestarsfalll): support Attribute, class A(a.B)
+        bases = []
+        for base in node.bases:
+            trace_info = []
+            self._get_chained_name(base, trace_info)
+            if trace_info:
+                trace_info.reverse()
+                bases.append("".join(trace_info))
+        self._local_defs[node.name] = _DefNode(node, _DefType.Class, bases=bases)
+
+    def _get_chained_name(self, node, trace_info):
         if isinstance(node, Attribute):
             trace_info.append(node.attr)
             trace_info.append(".")
             node = node.value
-            return self._get_call_name(node, trace_info)
+            return self._get_chained_name(node, trace_info)
         elif isinstance(node, Call):
             self._pass_controller.attach(node)
             node = node.func
             trace_info.append("()")
-            return self._get_call_name(node, trace_info)
+            return self._get_chained_name(node, trace_info)
         elif isinstance(node, Subscript):
             idx = node.slice.value
             if hasattr(idx, "value"):
@@ -200,7 +221,7 @@ class DefaultASTParser(NodeVisitor):
             else:
                 raise RuntimeError()
             trace_info.append(f"[{idx}]")
-            return self._get_call_name(node.value, trace_info)
+            return self._get_chained_name(node.value, trace_info)
         elif isinstance(node, Constant):
             node.id = trace_info[-1]
             return node
@@ -224,15 +245,15 @@ class DefaultASTParser(NodeVisitor):
         """
         func = node.func
         trace_info = []
-        func = self._get_call_name(func, trace_info)
+        func = self._get_chained_name(func, trace_info)
 
         name = func.id
         if trace_info:
             trace_info.reverse()
             name = "".join(trace_info)
         # if name not in self._local_defs:
-            # just build them, and clean it after whole parse stage
-            # prevent some issues caused by visit order (maybe)
+        # just build them, and clean it after whole parse stage
+        # prevent some issues caused by visit order (maybe)
         self._calls[name] = _CallNode(name, trace_info)
 
     # for getattr, but it also will be caught by visit_Call
